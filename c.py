@@ -55,39 +55,31 @@ def MapTokensToIndices(TOKEN_LIST, WORD_TO_INDEX):
 
 def BuildCenterContextIndexArrays(DOCS_AS_TOKEN_LISTS, WORD_TO_INDEX, WINDOW_RADIUS):
     """
-    MATERIALIZE EVERY (CENTER, POSITIVE_CONTEXT) INDEX PAIR FOR SKIP-GRAM.
-    WINDOW IS SYMMETRIC: ALL OFFSETS IN [-K, K] EXCLUDING ZERO.
+    VECTORIZED SKIP-GRAM PAIR MINING — SAME PAIRS AS NESTED LOOPS BUT FAST ON CPU.
+    FOR EACH OFFSET D IN [-K..-1] ∪ [1..K], SLICE ALIGNED CENTER / CONTEXT ARRAYS.
     """
-    CENTER_LIST = []
-    CONTEXT_LIST = []
+    CENTER_CHUNKS = []
+    CONTEXT_CHUNKS = []
     for TOKEN_LIST in DOCS_AS_TOKEN_LISTS.values():
-        INDEX_SEQ = MapTokensToIndices(TOKEN_LIST, WORD_TO_INDEX)
-        SEQ_LEN = len(INDEX_SEQ)
-        for CENTER_POS in range(SEQ_LEN):
-            CENTER_ID = INDEX_SEQ[CENTER_POS]
-            LOW = max(0, CENTER_POS - WINDOW_RADIUS)
-            HIGH = min(SEQ_LEN, CENTER_POS + WINDOW_RADIUS + 1)
-            for CONTEXT_POS in range(LOW, HIGH):
-                if CONTEXT_POS == CENTER_POS:
-                    continue
-                CONTEXT_LIST.append(INDEX_SEQ[CONTEXT_POS])
-                CENTER_LIST.append(CENTER_ID)
-    CENTER_ARRAY = np.asarray(CENTER_LIST, dtype=np.int64)
-    CONTEXT_ARRAY = np.asarray(CONTEXT_LIST, dtype=np.int64)
+        IDS = np.asarray(MapTokensToIndices(TOKEN_LIST, WORD_TO_INDEX), dtype=np.int64)
+        SEQ_LEN = int(IDS.shape[0])
+        if SEQ_LEN < 2:
+            continue
+        for OFFSET in list(range(-WINDOW_RADIUS, 0)) + list(range(1, WINDOW_RADIUS + 1)):
+            STEP = -OFFSET if OFFSET < 0 else OFFSET
+            if OFFSET > 0:
+                CENT_SLICE = IDS[:-STEP]
+                CTX_SLICE = IDS[STEP:]
+            else:
+                CENT_SLICE = IDS[STEP:]
+                CTX_SLICE = IDS[:-STEP]
+            CENTER_CHUNKS.append(CENT_SLICE)
+            CONTEXT_CHUNKS.append(CTX_SLICE)
+    if not CENTER_CHUNKS:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
+    CENTER_ARRAY = np.concatenate(CENTER_CHUNKS)
+    CONTEXT_ARRAY = np.concatenate(CONTEXT_CHUNKS)
     return CENTER_ARRAY, CONTEXT_ARRAY
-
-
-def BuildNoiseSamplingProbabilities(VOCAB_SIZE, INDEX_STREAM_FOR_COUNTS):
-    """
-    NOISE DISTRIBUTION P_n(w) ∝ COUNT(w)^0.75 — CLASSIC WORD2VEC SUBSAMPLE POWER.
-    RETURN NORMALIZED FLOAT32 TENSOR ON CPU FOR torch.multinomial.
-    """
-    COUNTS = np.zeros(VOCAB_SIZE, dtype=np.float64)
-    for IDX in INDEX_STREAM_FOR_COUNTS:
-        COUNTS[IDX] += 1.0
-    POWERED = np.power(COUNTS + 1e-12, 0.75)
-    PROBS = POWERED / POWERED.sum()
-    return torch.from_numpy(PROBS.astype(np.float32))
 
 
 class SkipGramBceModule(nn.Module):
@@ -142,13 +134,16 @@ def TrainSkipGram(
 
     DOCS = SplitDocsByArticleMarkers(CORPUS_PATH)
     VOCAB_SIZE = len(WORD_TO_INDEX)
-    FLAT_STREAM = []
+    UNIGRAM_COUNTS = np.zeros(VOCAB_SIZE, dtype=np.float64)
     for TOKEN_LIST in DOCS.values():
-        FLAT_STREAM.extend(MapTokensToIndices(TOKEN_LIST, WORD_TO_INDEX))
+        IDS = np.asarray(MapTokensToIndices(TOKEN_LIST, WORD_TO_INDEX), dtype=np.int64)
+        if IDS.size:
+            np.add.at(UNIGRAM_COUNTS, IDS, 1.0)
 
     CENTER_ARRAY, CONTEXT_ARRAY = BuildCenterContextIndexArrays(DOCS, WORD_TO_INDEX, WINDOW_RADIUS)
     PAIR_COUNT = CENTER_ARRAY.shape[0]
-    NOISE_PROBS = BuildNoiseSamplingProbabilities(VOCAB_SIZE, FLAT_STREAM)
+    POWERED = np.power(UNIGRAM_COUNTS + 1e-12, 0.75)
+    NOISE_PROBS = torch.from_numpy((POWERED / POWERED.sum()).astype(np.float32))
 
     MODEL = SkipGramBceModule(VOCAB_SIZE, EMBEDDING_DIM).to(DEVICE)
     OPTIMIZER = torch.optim.Adam(MODEL.parameters(), lr=LEARNING_RATE)
@@ -198,11 +193,12 @@ def TrainSkipGram(
                     round(LV, 5),
                     "elapsed_s",
                     round(ELAPSED, 2),
+                    flush=True,
                 )
 
         MEAN_EPOCH_LOSS = RUNNING_LOSS_SUM / max(1, RUNNING_BATCH_COUNT)
         EPOCH_MEAN_LOSSES.append(MEAN_EPOCH_LOSS)
-        print("epoch", EPOCH_INDEX + 1, "mean_loss", round(MEAN_EPOCH_LOSS, 5))
+        print("epoch", EPOCH_INDEX + 1, "mean_loss", round(MEAN_EPOCH_LOSS, 5), flush=True)
 
     os.makedirs(os.path.dirname(EMB_SAVE_PATH), exist_ok=True)
     V_WEIGHT = MODEL.V_EMB.weight.detach().cpu().numpy().astype(np.float32)
