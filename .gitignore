@@ -1,0 +1,5 @@
+embeddings/*.npy
+embeddings/*.png
+__pycache__/
+*.pyc
+Assignment 2 (1).pdf
